@@ -1,4 +1,3 @@
-
 import io
 import re
 import zipfile
@@ -30,15 +29,29 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Canonical internal column names
+PRIMARY_PREFIX = "Audit_2"
+FALLBACK_PREFIX = "Audit_1"
+
+PRIMARY_SCORE = f"{PRIMARY_PREFIX}_score"
+PRIMARY_RISK = f"{PRIMARY_PREFIX}_riskLevel"
+PRIMARY_ISSUES = f"{PRIMARY_PREFIX}_clinicalIssues"
+PRIMARY_TRANSLATION = f"{PRIMARY_PREFIX}_suggestedTranslation"
+
+FALLBACK_SCORE = f"{FALLBACK_PREFIX}_score"
+FALLBACK_RISK = f"{FALLBACK_PREFIX}_riskLevel"
+FALLBACK_ISSUES = f"{FALLBACK_PREFIX}_clinicalIssues"
+FALLBACK_TRANSLATION = f"{FALLBACK_PREFIX}_suggestedTranslation"
+
 REQUIRED_COLS = {
-    "Openai_score",
-    "Openai_riskLevel",
-    "Openai_clinicalIssues",
-    "Openai_suggestedTranslation",
-    "Gemini_score",
-    "Gemini_riskLevel",
-    "Gemini_clinicalIssues",
-    "Gemini_suggestedTranslation",
+    PRIMARY_SCORE,
+    PRIMARY_RISK,
+    PRIMARY_ISSUES,
+    PRIMARY_TRANSLATION,
+    FALLBACK_SCORE,
+    FALLBACK_RISK,
+    FALLBACK_ISSUES,
+    FALLBACK_TRANSLATION,
 }
 
 MODEL_COLS = REQUIRED_COLS.copy()
@@ -55,7 +68,7 @@ CJK_RANGES = [
     ("\uF900", "\uFAFF"),   # CJK Compatibility Ideographs
     ("\u0E00", "\u0E7F"),   # Thai
     ("\U00020000", "\U0002A6DF"),  # CJK Extension B
-    ("\U0002A700", "\U0002CEAF"),  # CJK Extensions C/D/E
+    ("\U0002A700", "\U0002CEAF"),   # CJK Extensions C/D/E
 ]
 
 
@@ -81,10 +94,80 @@ def count_units(text) -> int:
     cjk_count = sum(1 for ch in non_ws_chars if _is_cjk_char(ch))
     ratio = cjk_count / len(non_ws_chars)
 
-    # If the string is mostly CJK/Thai, count characters. Otherwise count words.
     if ratio >= 0.20:
         return len(non_ws_chars)
     return len([tok for tok in re.split(r"\s+", s) if tok])
+
+
+def normalize_col_name(name: str) -> str:
+    """
+    Normalize column names so variants like:
+    - Audit_Score_1
+    - Audit Score 1
+    - Audit_Score-1
+    - RiskLevel-1
+    - Suggested_translation_1
+    all map to a consistent comparison format.
+    """
+    s = str(name).strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+
+def standardize_audit_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename incoming Audit columns into a canonical internal schema.
+
+    Expected canonical schema:
+    - Audit_1_score
+    - Audit_1_riskLevel
+    - Audit_1_clinicalIssues
+    - Audit_1_suggestedTranslation
+    - Audit_2_score
+    - Audit_2_riskLevel
+    - Audit_2_clinicalIssues
+    - Audit_2_suggestedTranslation
+    """
+    aliases = {
+        PRIMARY_SCORE: {
+            "audit_score_2", "audit2_score", "audit_2_score", "auditscore2", "audit_score2"
+        },
+        PRIMARY_RISK: {
+            "risklevel_2", "risk_level_2", "audit_2_risklevel", "audit2_risklevel", "audit_risklevel_2"
+        },
+        PRIMARY_ISSUES: {
+            "audit_issues_2", "auditissues2", "audit_2_clinicalissues", "audit2_clinicalissues"
+        },
+        PRIMARY_TRANSLATION: {
+            "suggested_translation_2", "suggestedtranslation2", "audit_2_suggestedtranslation", "audit2_suggestedtranslation"
+        },
+        FALLBACK_SCORE: {
+            "audit_score_1", "audit1_score", "audit_1_score", "auditscore1", "audit_score1"
+        },
+        FALLBACK_RISK: {
+            "risklevel_1", "risk_level_1", "audit_1_risklevel", "audit1_risklevel", "audit_risklevel_1"
+        },
+        FALLBACK_ISSUES: {
+            "audit_issues_1", "auditissues1", "audit_1_clinicalissues", "audit1_clinicalissues"
+        },
+        FALLBACK_TRANSLATION: {
+            "suggested_translation_1", "suggestedtranslation1", "audit_1_suggestedtranslation", "audit1_suggestedtranslation"
+        },
+    }
+
+    norm_to_actual = {}
+    for c in df.columns:
+        norm_to_actual[normalize_col_name(c)] = c
+
+    rename_map = {}
+    for canonical, norm_aliases in aliases.items():
+        for norm_alias in norm_aliases:
+            if norm_alias in norm_to_actual:
+                rename_map[norm_to_actual[norm_alias]] = canonical
+                break
+
+    return df.rename(columns=rename_map)
 
 
 def detect_source_column(columns) -> str | None:
@@ -94,7 +177,6 @@ def detect_source_column(columns) -> str | None:
     cols = list(columns)
     lowered = {c.lower(): c for c in cols}
 
-    # First pass: strong name matches.
     exact_candidates = [
         "source",
         "source text",
@@ -114,14 +196,12 @@ def detect_source_column(columns) -> str | None:
         if candidate in lowered:
             return lowered[candidate]
 
-    # Second pass: loose hint matching.
     for c in cols:
         cl = c.lower()
         if any(hint in cl for hint in SOURCE_NAME_HINTS):
             if c not in MODEL_COLS:
                 return c
 
-    # Last resort: first non-model, non-glossary, non-file column.
     for c in cols:
         cl = c.lower()
         if c in MODEL_COLS:
@@ -190,48 +270,46 @@ def run_pipeline(df: pd.DataFrame, primary_min: int, fallback_min: int, filename
 
     df = df[df[source_col].notna()].copy()
 
-    df["Openai_score"] = pd.to_numeric(df["Openai_score"], errors="coerce")
-    df["Gemini_score"] = pd.to_numeric(df["Gemini_score"], errors="coerce")
+    df[PRIMARY_SCORE] = pd.to_numeric(df[PRIMARY_SCORE], errors="coerce")
+    df[FALLBACK_SCORE] = pd.to_numeric(df[FALLBACK_SCORE], errors="coerce")
 
-    primary_invalid = df["Openai_score"].isna() | (df["Openai_score"] < primary_min)
-    fallback_zero_or_missing = df["Gemini_score"].isna() | (df["Gemini_score"] == 0)
+    primary_invalid = df[PRIMARY_SCORE].isna() | (df[PRIMARY_SCORE] < primary_min)
+    fallback_zero_or_missing = df[FALLBACK_SCORE].isna() | (df[FALLBACK_SCORE] == 0)
     df = df[~(primary_invalid & fallback_zero_or_missing)].copy()
     stats["after_step1"] = len(df)
 
-    mask0 = df["Gemini_score"] == 0
+    mask0 = df[FALLBACK_SCORE] == 0
     for target_col, source_col_name in [
-        ("Gemini_score", "Openai_score"),
-        ("Gemini_riskLevel", "Openai_riskLevel"),
-        ("Gemini_clinicalIssues", "Openai_clinicalIssues"),
-        ("Gemini_suggestedTranslation", "Openai_suggestedTranslation"),
+        (FALLBACK_SCORE, PRIMARY_SCORE),
+        (FALLBACK_RISK, PRIMARY_RISK),
+        (FALLBACK_ISSUES, PRIMARY_ISSUES),
+        (FALLBACK_TRANSLATION, PRIMARY_TRANSLATION),
     ]:
         df.loc[mask0, target_col] = df.loc[mask0, source_col_name]
 
     stats["fallback_rows_updated"] = int(mask0.sum())
 
-    df = df[df["Gemini_score"] >= fallback_min].copy()
+    df = df[df[FALLBACK_SCORE] >= fallback_min].copy()
     stats["final_segments"] = len(df)
 
-    # Normalize final deliverable names.
     df = df.rename(
         columns={
             source_col: "Source Text",
-            "Gemini_clinicalIssues": "Clinical Issues",
-            "Gemini_suggestedTranslation": "Suggested Translation",
+            FALLBACK_ISSUES: "Clinical Issues",
+            FALLBACK_TRANSLATION: "Suggested Translation",
         }
     )
 
     cols_to_drop = [
-        "Openai_score",
-        "Openai_riskLevel",
-        "Openai_clinicalIssues",
-        "Openai_suggestedTranslation",
-        "Gemini_score",
-        "Gemini_riskLevel",
+        PRIMARY_SCORE,
+        PRIMARY_RISK,
+        PRIMARY_ISSUES,
+        PRIMARY_TRANSLATION,
+        FALLBACK_SCORE,
+        FALLBACK_RISK,
     ]
     df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
 
-    # Remove any score / risk columns that might exist under alternate names.
     for c in [col for col in df.columns if "score" in col.lower() or "risk" in col.lower()]:
         if c not in {"Source File"}:
             df = df.drop(columns=[c])
@@ -344,9 +422,9 @@ with st.sidebar:
         """
 **Pipeline steps**
 1. Drop rows where both scores are below threshold
-2. Merge primary into fallback fields when fallback score is 0
+2. Merge Audit 2 into Audit 1 fields when Audit 1 score is 0
 3. Remove model-specific columns
-4. Keep fallback score at or above the selected minimum
+4. Keep Audit 1 score at or above the selected minimum
 5. Count source text as words or characters automatically
 6. Tag source filename
 """
@@ -377,7 +455,7 @@ if not uploaded_files:
 
 Each file goes through the same pipeline:
 1. Filter out rows where both scores are 0 or blank
-2. Merge primary data into fallback columns where fallback score = 0
+2. Merge Audit 2 data into Audit 1 columns where Audit 1 score = 0
 3. Remove model-specific columns
 4. Keep only rows that meet the fallback threshold
 5. Count source text automatically as words or characters
@@ -401,6 +479,7 @@ for i, f in enumerate(uploaded_files):
 
         main_sheet = xls.sheet_names[0]
         df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=main_sheet, header=0)
+        df_raw = standardize_audit_columns(df_raw)
 
         missing = REQUIRED_COLS - set(df_raw.columns)
         if missing:
