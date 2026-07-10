@@ -285,6 +285,15 @@ def run_pipeline(df: pd.DataFrame, primary_min: int, fallback_min: int, filename
         (FALLBACK_ISSUES, PRIMARY_ISSUES),
         (FALLBACK_TRANSLATION, PRIMARY_TRANSLATION),
     ]:
+        # FIX: Some pipeline files leave the Audit_1_* text columns completely
+        # blank, so pandas infers them as float64 (all-NaN). Newer pandas
+        # (2.x / 3.x) will then raise:
+        #   "Invalid value [...] for dtype 'float64'"
+        # when we try to write Audit_2 strings into that column, because it
+        # no longer silently upcasts a numeric column to object dtype on
+        # assignment. Force the target column to a compatible dtype first.
+        if df[target_col].dtype != df[source_col_name].dtype:
+            df[target_col] = df[target_col].astype(object)
         df.loc[mask0, target_col] = df.loc[mask0, source_col_name]
 
     stats["fallback_rows_updated"] = int(mask0.sum())
